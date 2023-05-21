@@ -1,0 +1,584 @@
+---
+title: "PRADC: Prostate adenocarcinoma subtype discovery on multi-omics data through clustering"
+author: "Renato Avellar Nobre"
+date: "22 May 2023"
+csl: ieee.csl
+output:
+  html_notebook:
+    toc: yes
+    number_sections: no
+    toc_float: yes
+    theme: cerulean
+    fig_caption: yes
+---
+
+# 0. Project Setup
+
+First of all we need to install all the packages needed for the project and further load it into the environment. 
+The BiocManager package is a package manager to install and manage packages from the *Bioconductor project* for the statistical analysis and comprehension of high-throughput genomic data. For this project we will install the following *Bioconductor packages:* 
+
+- **curatedTCGAData:** assembles data on-the-fly from ExperimentHub to provide cohesive MultiAssayExperiment container objects. All the user has to do is to provide TCGA disease code(s) and assay types.
+- **TCGAutils:** toolbox to work with TCGA specific datasets. It allows the user to manipulate and translate TCGA barcodes. The package also provides functions for working with data from the curatedTCGAData experiment data package. It provides convenience functions for extracting subtype metadata data and adding clinical data to existing MultiAssayExperiment objects.
+- **TCGAbiolinks:** facilitate the TCGA open-access data retrieval, prepare the data using the appropriate pre-processing strategies, provide the means to carry out different standard analyses and allow the user to download a specific version of the data and thus to easily reproduce earlier research results.
+
+
+```{r message=FALSE, warning=FALSE}
+# Install required packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("curatedTCGAData");
+BiocManager::install("TCGAutils");
+BiocManager::install("graph");
+BiocManager::install("TCGAbiolinks");
+
+install.packages("SNFtool");
+install.packages("cluster");
+install.packages("mclustcomp");
+install.packages("factoextra")
+```
+
+Loading the libraries:
+
+```{r message=FALSE, warning=FALSE}
+# Load required packages
+library("curatedTCGAData");
+library("TCGAutils");
+library("TCGAbiolinks");
+library("SNFtool");
+library("cluster");
+library("mclustcomp");
+library("ggplot2")
+library("factoextra")
+```
+
+
+# 1. Download Data
+
+**Task 1:** Download the Prostate adenocarcinoma dataset considering three different omics data sources (mRNA, miRNA and protein expression data). The TCGA code for the dataset is “PRAD”.
+
+The idea behind the PRADC methodology is to work with a multi-omics dataset from prostate cancer patients. We fetch a prostate cancer multi-omics dataset from The Cancer Genome Atlas (TCGA) program. In particular, we exploit the package “curatedTCGAData” to download the following assays: mRNA, miRNA and proteins. Each assay represents a different aspect of the biological state within the cells. The rationale behind utilizing multiple data sources is that the interactions of diverse molecules influence a biological system. Thus, considering multiple biological data sources simultaneously, we can better understand the underlying processes at work. 
+
+```{r}
+load_data <- function(code, assays) {
+  # Download the data with the desireds assays
+  mo <- curatedTCGAData(diseaseCode = code, assays = assays, 
+                      version = "2.0.1", dry.run = FALSE);
+
+  mo <- mo[, , paste0("PRAD", "_", assays, "-20160128")];
+  return(mo)
+}
+
+# Prostate cancer dissease code
+diseaseCode = "PRAD"
+# mRNA, miRNA, and protein assays
+assays <- c("RNASeq2Gene", "miRNASeqGene", "RPPAArray");
+data = load_data(diseaseCode, assays)
+```
+
+```{r}
+# Print summary of data
+data;
+```
+
+# 2. Data pre-processing
+
+**Task 2:** Pre-process the dataset following the same steps we used during lessons. During the filtering by variance, select the first 100 features having highest variance from each data source.
+
+The preprocessing starts with the individual omics from the selected assays and is applied independently for each of the three. The first two steps are related to the barcode and are used to filter the data.
+
+## Barcode Preprocessing 
+
+```{r}
+# Filter to keep only primary solid tumors
+filter_primary_solid_tumours <- function(data) {
+  primary_solid_tumors_code <- "01"
+  # In TCGA "Primary Solid Tumors" are identified by the code "01" in the sample part of the barcode
+  primary <- TCGAutils::TCGAsampleSelect(colnames(data), c(primary_solid_tumors_code));
+  data <- data[, primary, ]
+  return(data)
+} 
+
+# Check for replicates
+
+check_duplicates <- function(data) {
+  # `anyReplicated` checks the primary unit in the sampleMap of the MultiAssayExperiment object, that corresponds to the first 12 characters of the barcodes for TCGA data
+  check_rep <- anyReplicated(data);
+  print(check_rep);
+}
+```
+ 
+We start the preprocessing by fetching only primary solid tumours (original tumours). In the TCGA Barcode, primary solid tumours are identified by the code "01" in the sample part of the code. The idea behind using only primary solid tumours is to have a more homogeneous group of samples.
+
+```{r  message=FALSE, warning=FALSE}
+data = filter_primary_solid_tumours(data)
+```
+
+Additionally, the barcode enables us to perform a second preprocessing step: checking for technical duplicates. Since repeated measurements taken from the same sample are not attractive to the application, we use the barcode to check for any repeated string in the 12 first characters and remove any possible duplicates. 
+
+```{r}
+check_duplicates(data)
+```
+
+## Additional Preprocessing
+
+Further, an additional set of preprocessing activities is performed to standardize, remove unused data and filter the features and samples.
+
+```{r}
+# Remove FFPE storage
+remove_FFPE <- function(data) {
+  # The information regarding if the sample is FFPE is stored in the clinical data, which are accessible using colData(). 
+  no_ffpe <- which(as.data.frame(colData(data))$patient.samples.sample.is_ffpe == "no");
+  data <- data[, no_ffpe, ];
+  return(data)
+}
+
+# Generate feature matrixes
+gen_feature_matrixes <- function(data) {
+  # Obtain samples having all the considered omics:
+  complete <- intersectColumns(data);
+
+  # Extract assays in list:
+  complete <- assays(complete);
+
+  # Obtain matrices samples x features:
+  complete <- lapply(complete, FUN=t)
+  return(complete)
+}
+
+# Remove features having NAs (present only in proteomics data):
+remove_na <- function(data) {
+  data[[1]] <- data[[1]][, colSums(is.na(data[[1]])) == 0];
+  data[[2]] <- data[[2]][, colSums(is.na(data[[2]])) == 0];
+  data[[3]] <- data[[3]][, colSums(is.na(data[[3]])) == 0];
+  return(data)
+}
+
+# Remove features with near zero variance and retain top 100 features having higher variance:
+top_features <- function(data, num_features) {
+  # For each session experiment
+  for(i in 1:length(data)){
+      # Get ids of near zero var features
+      idx <- caret::nearZeroVar(data[[i]])
+      # Print ammount of this features
+      print(paste("Removed ", length(idx), "features from", names(data)[i]));
+      if(length(idx) != 0){
+          # Remove this features from data if found
+          data[[i]] <- data[[i]][, -idx];
+      }
+  
+      # If the ammount of features already less than expecte pass to next experiment
+      if(ncol(data[[i]]) <= num_features) next
+      
+      # Get variance of features
+      vars <- apply(data[[i]], 2, var);
+      # Get Ids of higer vars and order
+      idx <- sort(vars, index.return=TRUE, decreasing = TRUE)$ix;
+      # Split dataset to keep only the num_features ammount
+      data[[i]] <- data[[i]][, idx[1:num_features]];
+  } 
+  return(data)
+}
+
+# Perform features standardization using z-score:
+zscore <- function(data){
+    # ZScore math function
+    zscore_vec <- function(x) { return ((x - mean(x)) / sd(x))}
+    # Apply zcore on data
+    data <- apply(data, 2, zscore_vec)
+    return(data)
+}
+
+# Clean barcodes retaining only "Project-TSS-Participant"
+clean_barcodes <- function(data) {
+  for(v in 1:length(data)){
+    # Update names of the rows by keeping only 12 first chars
+    rownames(data[[v]]) <- substr(rownames(data[[v]]), 1, 12);
+  }
+  return(data)
+}
+
+```
+
+We are starting by removing FFPE (Formalin-Fixed Paraffin-Embedded) samples. After performing a biopsy, storing and preserving the sample properly is essential. There are two main methods for preparing the tissue: (1) FFPE (Formalin-Fixed Paraffin-Embedded) and (2) freezing the sample. Freezing the tissue helps to preserve DNA and RNA molecules more effectively. Thus we exclude samples that have been preserved using the FFPE technique.
+
+```{r}
+data <- remove_FFPE(data)
+```
+
+Following, we filter only the samples with all considered omics, disregarding all samples of patients which do not present mRNA, miRNA and protein data. The fetched samples are extracted in a list of three matrices, where each matrix is information on the samples for that specific omics data. The matrices are also transposed to have samples in rows and features in columns.
+
+```{r}
+data <- gen_feature_matrixes(data)
+```
+
+Now that we have our sample and features as matrices, further preprocessing is more straightforward. The following step is to remove features having missing values. Since only a few features in the proteomics data have missing values, it is easier and not significantly impacting to only remove instead of performing some process of imputation.
+
+```{r}
+data <- remove_na(data)
+```
+
+Further, we select the features that have higher variance across the samples. This is based on a strong assumption that features with more variance across samples bring more information, thus being the more relevant ones. This feature selection strategy is widely used in literature due to its speed, but it has some limitations. Besides being univariate (not considering interactions among features), it does not effectively remove redundant variables. Additionally, we need to select a threshold for the number of features to select. For the PRADC project, we arbitrarily select 100 features.
+
+```{r}
+data = top_features(data, 100)
+```
+
+The previous to last step of the preprocessing phase is feature standardization. PRADC standardize features using Z-score. The Z-score is a statistical measure representing the number of standard deviations an individual data point is from the mean of a given dataset. This standardization helps understand how far away a data point is from the mean relative to the spread of the data. A positive Z-score indicates that the data point is above the mean, while a negative Z-score indicates that it is below the mean. 
+
+```{r}
+data <- lapply(data, zscore);
+```
+
+Finally, the last step of the data preprocessing is cleaning the sample barcodes to retain only the 12-character part specific to each individual. With this modification, we can better identify our data rows and provide a simple method of matching the omics data with the disease subtypes.
+
+```{r}
+data = clean_barcodes(data)
+```
+
+# 3. Prostate cancer disease subtypes
+
+**Task 3:** Download the disease subtypes (column “Subtype_Integrative” is the one containing the iCluster molecular subtypes). Note that not all subtypes are available for the set of samples having all the considered omics data sources, thus you need to retain from the multi-omics dataset only samples having an associated subtype.
+
+The classification of a cancer sample to a specific disease subtype helps predict patients' prognosis, and it also impacts the definition of the therapy. Defining and identifying subtypes allows grouping similar individuals, which may help the field of ``personalized medicine''  better predict their prognosis and appropriate therapy. Therefore this research uses the TCGAbiolinks package to fetch the subtypes data.
+
+```{r}
+# Download disease subtypes from TCGAbiolinks
+fetch_diseases_subtypes <- function(code) {
+  # Get all subtypes
+  subtypes <- as.data.frame(TCGAbiolinks::PanCancerAtlas_subtypes());
+  # Slice the subtypes with the desired code
+  subtypes <- subtypes[subtypes$cancer.type == code, ]
+  return(subtypes)
+}
+
+
+filter_subtypes <- function(subtypes) {
+  # Retain only primary solid tumors 
+  subtypes <- subtypes[TCGAutils::TCGAsampleSelect(subtypes$pan.samplesID, "01"), ];
+  # Check if name of the patient is on data
+  sub_select <- substr(subtypes$pan.samplesID,1,12) %in% rownames(data[[1]]);
+  # Filter Subtypes with the proper names
+  subtypes <- subtypes[sub_select, ];
+  # Index the subtypes datframe with the proper names
+  rownames(subtypes) <- substr(subtypes$pan.samplesID, 1, 12);
+  return (subtypes)
+  
+}
+
+filter_omics_samples <- function(data, subtypes) {
+  # Check for patients in the subtypes
+  sub_select <- rownames(data[[1]]) %in% substr(subtypes$pan.samplesID,1,12)
+  for(i in 1:length(data)){
+    data[[i]] <- data[[i]][sub_select, ];
+  }
+
+  return (data)
+}
+
+order_subtypes <- function(subtypes, data) {
+  subtypes <- subtypes[rownames(data[[1]]),];
+  return(subtypes)
+}
+```
+
+
+Prostate cancer can be divided into multiple different subtypes classifications. TCGA Network's research, revealed a molecular taxonomy in which 74% of the tumours fell into one of seven subtypes defined by specific gene fusions (ERG, ETV1, ETV4, and FLI1) or mutations (SPOP, FOXA1, and IDH1). The TCGAbiolinks package considers this classification the most prominent and is used in their data "Subtype_Selected" column. However, the TCGA Network in the same research, using the iCluster technique, were able to identify also three significant groups of prostate cancers. One with mostly unaltered genomes, a second group comprised 50% of all tumours, exhibited an intermediate level of somatic copy number alterations (SCNAs), and a third group with a high frequency of genomic gains and losses at the level of chromosome arms. The iCluster subtypes are labelled as the "Subtype_Integrative" column in the data. They are used as the baseline for the PRADC research since its subtype classification is more approachable while still being relevant to patients' predicted prognosis. Additionally, the iCluster subtype is also interesting for our specific application since it also comes from a multi-omics integrative analysis. Therefore this research tries to verify if the computed clusters with the proposed techniques are similar to the iCluster disease subtypes provided by TCGA for prostate cancer.
+
+
+```{r}
+disease_subtypes = fetch_diseases_subtypes(diseaseCode)
+```
+
+Analyzing the data is noticed that not all subtypes are present in the subset of samples that contain all the considered omics data sources. Therefore, it was necessary only to include samples from the multi-omics dataset with an associated subtype. With this step, we could filter samples with the disease subtypes in the selected omics, achieving the final shape of the data points. Therefore the final subtypes database consisted of 60 patients of Type-1, 83 patients of Type-2 and 105 patients of Type-3, totalizing 248 select patients for the multi-omics data clustering. Finally, our data shape is made of a vector of 3 matrices (one for each omic), where each matrix contains 248 rows (samples/patients) and 100 columns (high variance selected features).
+
+```{r}
+# Select disease samples in common with omics data
+disease_subtypes = filter_subtypes(disease_subtypes)
+
+# Select omics samples in common with subtypes data
+data = filter_omics_samples(data, disease_subtypes)
+
+# Order the subtypes to match the patients
+disease_subtypes = order_subtypes(disease_subtypes, data)
+
+# Print number of samples for each subtype:
+table(disease_subtypes$Subtype_Integrative);
+```
+
+# 4. Data Check
+
+**Task 4:** Check that patients in multi-omics dataset and subtypes are in the same order.
+
+```{r}
+check_dims <- function(data, disease_subtypes) {
+  # Get dimension of each experiment and the subtypes
+  dim_1 = dim(data[[1]])[1]
+  dim_2 = dim(data[[2]])[1]
+  dim_3 = dim(data[[3]])[1]
+  dim_disease = dim(disease_subtypes)[1]
+  # Check for equality
+  if(dim_1 == dim_2 & dim_2 == dim_3 & dim_3 == dim_disease){
+    print("Dimensions match!")
+  } else {
+    print("[ERROR] Dimensions do not match!")
+  }
+}
+
+check_names <- function(data, disease_subtypes) {
+  # Get rownames for each experiment and subtypes
+  subtype_rows = rownames(disease_subtypes)
+  mRNA_rows = rownames(data[[1]])
+  miRNA_rows = rownames(data[[2]])
+  PROTEINS_rows = rownames(data[[3]])
+  # Check for equality
+  if (all(mRNA_rows == miRNA_rows) & all(miRNA_rows == PROTEINS_rows) & all(mRNA_rows == subtype_rows)) {
+    print("Names match in order!")
+  } else {
+    print("[ERROR] Names do not match!")
+  }
+}
+```
+
+
+```{r}
+check_dims(data, disease_subtypes)
+check_names(data, disease_subtypes)
+```
+
+
+# 5. Similarity Network Fusion
+
+**Task 5:** Integrate the data using Similarity Network Fusion with the scaled exponential euclidean distance.
+
+
+For working with multi-omics data, a suitable method for fusing the diverse omics into a single data source is needed for most machine learning applications. Integrating different omics data is challenging in scientific research, and numerous methods have been proposed to address this issue. In this research, the basis of every integration method is the construction of a similarity matrix among samples for each data source, exploiting the scaled exponential Euclidean distance as a similarity measure.
+
+The reasoning for choosing the scaled exponential Euclidean distance is based on its local normalization of the distance between a central node and any of its neighbours so that distances are independent of the neighbourhood scales. The neighbourhood size set to PRADC study for the scaled exponential Euclidean distance was arbitrarily set to 20.
+
+```{r}
+# Compute similarity matrix for each data source using the scaled exponential euclidean distance
+compute_similarity_matrix <- function(data_list) {
+  # Create empty list
+  W_list <- list();
+  for(i in 1:length(data_list)){
+    # Create distance matrix
+    Dist <- (dist2(as.matrix(data_list[[i]]), as.matrix(data_list[[i]])))^(1/2);
+    # Create affinity matrix and assing to list
+    W_list[[i]] <- affinityMatrix(Dist, K=20);
+  }
+  
+  return(W_list)
+}
+
+similarity_matrices <- compute_similarity_matrix(data)
+```
+
+With the similarity matrices created, we fuse our prostate cancer multi-omic dataset with two different strategies. The state-of-the-art approach SNF, implemented in the package SNFtool. 
+
+```{r}
+# Integration of multi-omics data using Similarity Network Fusion:
+# t is the number of iterations and K is the number of neighbours to 
+# consider to compute the local similarity matrix:
+snf_matrix <- SNF(similarity_matrices, K=20, t=20);
+```
+
+# 6. Simple Average Integration
+
+**Task 6:** Try to integrate the similarity matrices from each data source (computed by scaled exponential euclidean distance) using a simple average of the matrices. This can be considered as a trivial multi-omics data integration strategy.
+
+```{r}
+simple_avg_integration <- function(similarity_matrices){
+  # Calculate avg matrix
+  mat <- (similarity_matrices[[1]] + similarity_matrices[[2]] + similarity_matrices[[3]])/3
+  return(mat)
+}
+```
+
+And the simple average of the matrices, which can be considered a trivial multi-omics data integration strategy. 
+
+```{r}
+avg_matrix <- simple_avg_integration(similarity_matrices)
+```
+
+# 8. Disease subtype discovery by clustering approaches
+
+**Task 8:** Perform disease subtype discovery (number of clusters equal to the number of disease subtypes found by iCluster) using PAM algorithm on the following similarity matrices.
+
+Finally, with the integrated multi-omics data, we can perform disease subtype discovery using the PAM and the Spectral Clustering algorithms. Since we are aiming to understand the impact of the integrated data method and the clustering algorithm, we performed the following clustering/similarity matrices combinations:
+
+- mRNA single sources PAM clustering
+- miRNA single source PAM clustering
+- Proteins single source PAM clustering
+- Average data integration PAM clustering
+- SNF PAM clustering
+- SNF Spectral Clustering
+
+```{r}
+# Select k to be thue ammount of clusters in Subtype_Integrative
+k <- length(unique(disease_subtypes$Subtype_Integrative));
+
+# Create istance matrix
+dist_matrix <- function(data){
+  dist <- 1 - NetPreProc::Prob.norm(data)
+  D <- as.dist(dist) 
+  return(D)
+}
+```
+
+## a. Single Data Source Similarity Matrices
+
+**Task a:** Similarity matrices obtained from single data sources (i.e. miRNA, mRNA, proteins) using the usual scaled exponential euclidean distance. Thus, you should obtain three different similarity matrices. To compute the corresponding distance matrix use this code: dist <- 1 - NetPreProc::Prob.norm(W). Prob.norm() function is in the NetPreProc CRAN package (https://cran.r-project.org/web/ packages/NetPreProc/index.html). The idea is to normalize the similarity matrix before computing the corresponding distance.
+
+
+The similarity matrices for the first three experiments were obtained from single data sources (i.e., miRNA, mRNA, proteins) using the usual scaled exponential Euclidean distance. Thus, we cluster independently three different similarity matrices. For all PAM clustering methods, we need to provide the input as a distance matrix, and for the single source and average, these distance matrices need to be normalized.
+
+```{r}
+# Get distance matrix for single omic
+dist_mRNA = dist_matrix(similarity_matrices[[1]])
+dist_miRNA = dist_matrix(similarity_matrices[[2]])
+dist_RPP = dist_matrix(similarity_matrices[[3]])
+
+# Cluster each single omics
+res_mRNA <- pam(dist_mRNA, k=k);
+res_miRNA <- pam(dist_miRNA, k=k);
+res_RPP <- pam(dist_RPP, k=k);
+```
+
+## b. Avarage Similarity Matrices
+
+**Task b:** Integrated matrix obtained using the average among matrices. Use dist <- 1 - NetPreProc::Prob.norm(W) to compute the distance matrix.
+
+```{r}
+# Cluster avg distance matrix
+res_avg <- pam(dist_matrix(avg_matrix), k=k);
+```
+
+## c. Similarity Network Fusion Similarity Matrices
+
+**Task c:** Integrated matrix obtained using Similarity Network Fusion.
+
+```{r}
+# Cluster SNF distance matrix
+res_snf <- pam(as.dist(1 - snf_matrix), k=k);
+```
+
+# 10. Spectral Clustering 
+
+**Task 10:** Apply Spectral Clustering on the integrated matrix obtained using Similarity Network Fusion (an implementation of spectral clustering is SNFtool::spectralClustering().
+
+
+As a bonus experiment, we cluster the SNF using the Spectral Clustering algorithm. This approach leverages the concept of spectral decomposition to transform the data into a lower-dimensional space where the clusters can be more easily identified. The spectral clustering algorithm allows for detecting clusters that may have complex shapes or are not linearly separable in the original feature space. Therefore, it often outperforms traditional clustering algorithms such as the k-means and PAM algorithm. In our work, spectral clustering is performed with the support of the SNFtool library, using k=3 for the number of clusters.
+
+```{r}
+# Spectral cluster snf distance matrix
+res_spectral_snf <- SNFtool::spectralClustering(snf_matrix, k)
+```
+
+
+# 11. Results Comparison
+
+**Task 11:** Compare the clusterings obtained by each considered approach w.r.t. the iCluster disease subtypes. Make tables and plots to show the results and discuss them.
+
+This section presents the methodology adopted and the results obtained to draw insights from the proposed solution. However, we must first define cluster-comparing metrics to evaluate the proposed solutions and compare the clusters obtained by each considered approach for the iCluster disease subtypes. Many measures to compare clusters are available in the literature. Those metrics are already implemented in the mclustcomp R package, which we used in our research. From the 24 different scores available in the package, we handpicked four commonly used measures to compare clusters:
+
+- **Rand Index (RI):** Measure that quantifies the agreement between two sets of clusters by ``counting pairs''. It calculates the similarity by comparing pairs of data points and determining if they are assigned to the same or different clusters in both sets. The Rand Index ranges from 0 to 1, where 0 indicates no agreement, and 1 indicates perfect agreement.
+- **Adjusted Rand Index (ARI):** A variation of the Rand Index that considers agreement by chance. The ARI considers that some agreement between two clusters can occur by chance and provides a value ranging from -1 to 1. A value of 1 indicates perfect agreement, 0 suggests agreement by chance, and negative values indicate worse agreement than expected by chance.
+- **Normalized Mutual Information (NMI):** Measure derived from Mutual Information, which measures the amount of information obtained about one set when the other set is known. The NMI adjusts the Mutual Information by dividing it by the average entropy of the two sets, thus normalizing the value between 0 and 1. A higher NMI value indicates a more significant similarity, while a lower value suggests less similarity. The NMI provides a normalized measure that accounts for the inherent differences in the sizes and entropies of the compared sets.
+- **Jaccard Index:** Measure calculated by dividing the size of the intersection of the sets by the size of the union of the sets. The resulting value ranges from 0 to 1, where 0 represents no similarity, and 1 represents complete similarity. Although it’s easy to interpret, it is sensitive to small sample sizes.
+
+```{r}
+# Get labels from icluster
+icluster_labels <- as.numeric(factor(disease_subtypes$Subtype_Integrative, levels=unique(disease_subtypes$Subtype_Integrative)));
+
+# Get the similarity metrics which will me used
+metrics <- c("rand", "adjrand", "nmi1", "jaccard");
+
+# Get the metrics for each experiment
+metrics_snf <- mclustcomp(res_snf$clustering, icluster_labels, types=metrics);
+metrics_avg <- mclustcomp(res_avg$clustering, icluster_labels, types=metrics);
+metrics_mRNA <- mclustcomp(res_mRNA$clustering, icluster_labels, types=metrics);
+metrics_miRNA <- mclustcomp(res_miRNA$clustering, icluster_labels, types=metrics);
+metrics_PROT <- mclustcomp(res_RPP$clustering, icluster_labels, types=metrics);
+metrics_spectral_clustering <- mclustcomp(res_spectral_snf, icluster_labels, types=metrics);
+```
+
+The table bellow summarizes the resulting metrics for each experiment. The Table shows that all the clustering results have overlapped, although they are minimal. First, notice that all metrics of the SNF Integration and Spectral clustering outperform the metrics of the single omics data, which shows a strong indicator that the multi-omics data provides better results. However, this analysis is not valid for the average integration technique, which outperforms the protein and miRNA single-omics but not the mRNA. Except for the NMI, the mRNA metrics outperform the average integration metrics, which could indicate that mRNA has higher clustering power concerning the miRNA and proteins. It is also a possible indicator that simple data integration techniques don't add value if a single omic's information is more relevant than others. This hypothesis could be validated with a weighted average with a higher weight for the mRNA omics. For a complete discussion of the results check the project report.
+
+```{r}
+# Constuct a dataframe for the metrics
+N <- 6
+df <- data.frame(Experiments=rep("", N),
+                 ARI=rep(NA, N),
+                 JACCARD=rep(NA, N),
+                 NMI=rep(NA, N),
+                 RI=rep(NA, N),
+                 stringsAsFactors=FALSE) 
+df[1, ] <- append(list("mRNA"), metrics_mRNA$scores)
+df[2, ] <- append(list("miRNA"), metrics_miRNA$scores)
+df[3, ] <- append(list("Proteins"), metrics_PROT$scores)
+df[4, ] <- append(list("Avg Integration"), metrics_avg$scores)
+df[5, ] <- append(list("SNF Integration"), metrics_snf$scores)
+df[6, ] <- append(list("Spectral Clustering"), metrics_spectral_clustering$scores)
+
+# Print dataframe
+df
+```
+```{r}
+# Constuct a dataframe for the count of clustering groups
+N <- 7
+df_counts <- data.frame(Experiments=rep("", N),
+                 Cluster1=rep(NA, N),
+                 Cluster2=rep(NA, N),
+                 Cluster3=rep(NA, N),
+                 stringsAsFactors=FALSE) 
+
+
+df_counts[1, ] <- list("mRNA", count(res_mRNA$clustering, value=1), count(res_mRNA$clustering, value=2), count(res_mRNA$clustering, value=3))
+df_counts[2, ] <- list("miRNA", count(res_miRNA$clustering, value=1), count(res_miRNA$clustering, value=2), count(res_miRNA$clustering, value=3))
+df_counts[3, ] <- list("Proteins", count(res_RPP$clustering, value=1), count(res_RPP$clustering, value=2), count(res_RPP$clustering, value=3))
+df_counts[4, ] <- list("Avg Integration", count(res_avg$clustering, value=1), count(res_avg$clustering, value=2), count(res_avg$clustering, value=3))
+df_counts[5, ] <- list("SNF Integration", count(res_snf$clustering, value=1), count(res_snf$clustering, value=2), count(res_snf$clustering, value=3))
+df_counts[6, ] <- list("Spectral Clustering", count(res_spectral_snf, value=1), count(res_spectral_snf, value=2), count(res_spectral_snf, value=3))
+df_counts[7, ] <- list("iCluster", count(icluster_labels, value=1), count(icluster_labels, value=2), count(icluster_labels, value=3))
+
+# Print dataframe
+df_counts
+```
+
+
+In addition to the metrics result, we provide a plot visualization of the obtained clusters. To be able to visualize, we performed a dimensionality reduction using Principal Component Analysis (PCA). PCA transforms high-dimensional data into a lower-dimensional representation while retaining the most critical information. First, we generated a clustering for the iCluster results using the data from the SNF integration since it was the most prominent method. Figure bellow shows the obtained clusters, and the overlap between the clusters in two dimensions is clear. The overlap could indicate that considering only the two features with the higher variance is insufficient to separate the clusters.
+
+```{r}
+# Plot pca results
+pca_cluster_visualization <- function(data, clusters, title) {
+  # Perform pca with two features
+  res.pca <- prcomp(data)
+  #Plot the result
+  fviz_pca_ind(res.pca,
+    geom.ind = "point",                   # Point to not show text
+    col.ind  = as.factor(clusters),       # Color of the points to be the clusters
+    addEllipses = TRUE,                   # Elipse of the clustering region
+    ellipse.type = "convex",              # Set the 'ellipse' to be the convex hull
+    title=title,                          # Title of the plot
+    legend.title = "Clusters",            # Title of the legent
+    ggtheme = theme_gray()                # Custom theme
+  )  
+}
+
+# Plot every cluster
+pca_cluster_visualization(as.dist(1 - snf_matrix), icluster_labels, title="iClusters")
+pca_cluster_visualization(dist_mRNA, res_mRNA$clustering, title="mRNA Clusters")
+pca_cluster_visualization(dist_miRNA, res_miRNA$clustering, title="miRNA Clusters")
+pca_cluster_visualization(dist_RPP, res_RPP$clustering, title="PROT Clusters")
+pca_cluster_visualization(dist_matrix(avg_matrix), res_avg$clustering, title="Avg Clusters")
+pca_cluster_visualization(as.dist(1 - snf_matrix), res_snf$clustering, title="SNF Clusters")
+pca_cluster_visualization(as.dist(1 - snf_matrix), res_spectral_snf, title="Spectral Clusters")
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo();
+```
